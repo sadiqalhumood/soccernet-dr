@@ -1,0 +1,295 @@
+% CVPR-style paper outline
+% Soccer Video Understanding via Sliding-Window Vision-Language Retrieval
+
+\documentclass[10pt,twocolumn]{article}
+
+% ---- packages ----
+\usepackage[margin=1in]{geometry}
+\usepackage{times}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{dblfloatfix} % fixes two-column float ordering
+
+
+% ---- title ----
+\title{%
+  Vision-Language Models for Soccer Video Retrieval:\\
+  Moment Retrieval and Action Spotting via\\
+  Sliding-Window Embedding Search
+}
+
+\author{
+  Sadiq Al-Humood \quad Silvio Giancola \\
+  King Abdullah University of Science and Technology (KAUST) \\
+  \texttt{sadiq.alhumood@kaust.edu.sa}
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+% ==================================================================
+\begin{abstract}
+We study natural language grounding in broadcast soccer video across two tasks: moment retrieval, where a free-form caption must be localized to a single timestamp, and action spotting, where a class label must be matched to all its occurrences. Both are cast as cross-video problems, requiring search across 471 games and roughly 1.1 million sliding-window candidates. We propose a unified pipeline that extracts per-frame embeddings offline and ranks windows by cosine similarity to the text query at inference, requiring no task-specific architecture. We instantiate it with CLIP ViT-L/14 and Qwen3-VL-Embedding-8B as drop-in backbones, and introduce an oracle diagnostic framework that decomposes retrieval error into game-selection and within-game components. Zero-shot CLIP achieves 0.77\% R@1 on moment retrieval and 1.83\% mAP@5s on action spotting, with the oracle analysis showing a 5.7$\times$ gap attributable to game-selection failure rather than event localization. We further propose a pairwise fine-tuning recipe for CLIP that operates on a single V100 without large-batch contrastive requirements.
+\end{abstract}
+
+% ==================================================================
+\section{Introduction}
+% ------------------------------------------------------------------
+
+A broadcast soccer match runs over 90 minutes and contains dozens of semantically distinct events---goals, fouls, corners, substitutions---embedded in long stretches of visually similar play. We study two natural language grounding tasks over this footage: \textbf{moment retrieval}, where a free-form caption must be localized to a single timestamp, and \textbf{action spotting}, where a class label (e.g., ``Goal'') must be matched to all its occurrences. Both tasks are cast as \emph{cross-video} problems: the model searches across 471 games (${\sim}$1.1M sliding windows) with no oracle knowledge of which game is relevant.
+
+We propose a unified \textbf{sliding-window retrieval pipeline} that applies to both tasks without architectural changes. Per-frame embeddings are extracted offline at 2\,fps; at query time, frames within a $\pm$5s window are mean-pooled and ranked by cosine similarity to the text query. We instantiate this pipeline with two backbones: \textbf{CLIP ViT-L/14}~\cite{radford2021clip} (768-dim) and \textbf{Qwen3-VL-Embedding-8B}~\cite{qwen3vl} (4096-dim), and complement them with a pairwise fine-tuning recipe for CLIP that requires only a single V100.
+
+To interpret results, we introduce an \textbf{oracle diagnostic framework} with three baselines---Oracle(Time), Oracle(Order), and Oracle(Time+Order)---that isolate game-selection error from within-game ranking error. Zero-shot CLIP reaches 0.77\% R@1 cross-video but 4.36\% with the correct game given, revealing that the dominant bottleneck is game retrieval, not event localization.
+
+\noindent\textbf{Contributions:}
+\begin{itemize}[nosep, leftmargin=*]
+  \item A unified sliding-window pipeline for moment retrieval and action spotting with any VLM encoder.
+  \item An oracle diagnostic framework that decomposes cross-video retrieval error into game-selection vs.\ within-game components.
+  \item Zero-shot and fine-tuned baselines with CLIP and Qwen3-VL-Embedding on SoccerNet Dense Captioning and SoccerNet-v2.
+\end{itemize}
+
+% ==================================================================
+\section{Related Work}
+% ------------------------------------------------------------------
+
+\noindent\textbf{Action Spotting.}
+SoccerNet~\cite{giancola2018soccernet} introduced the action spotting task over broadcast soccer with 3 classes; SoccerNet-v2~\cite{deliege2021soccernetv2} expanded this to 17 classes across 500 games. Subsequent work trained task-specific temporal models---convolutional spotters, transformer-based E2E-Spot~\cite{hong2022e2espot}---directly on these labels. Our work differs: we ask whether a general-purpose vision-language model can spot actions zero-shot via text-to-video cosine similarity, without any task-specific training.
+
+\noindent\textbf{Video Moment Retrieval.}
+Natural language video grounding~\cite{anne2017localizing} localizes a text query within a \emph{single} video. Cross-video retrieval---finding the right moment across a large corpus---is harder and less studied. The MAD dataset~\cite{soldan2022mad} introduced this setting at movie scale. SoccerNet Dense Video Captioning~\cite{zhou2024soccernet} provides the soccer equivalent with 36,894 annotated moments across 471 games. We use this benchmark and evaluate in the cross-video setting.
+
+\noindent\textbf{Vision-Language Models.}
+CLIP~\cite{radford2021clip} learns aligned image and text embeddings via contrastive pretraining on 400M web image-text pairs. Its ViT-L/14 variant produces 768-dim embeddings and runs efficiently on a single V100. Qwen3-VL-Embedding-8B~\cite{qwen3vl} is an 8B-parameter LLM fine-tuned for dense retrieval; it pools the final hidden state at the EOS token to produce 4096-dim embeddings and achieves state-of-the-art results on the MMEB-V2 multimodal retrieval benchmark. Both models share a common interface---encode image and text separately, compare by cosine similarity---which makes them drop-in replacements in our pipeline.
+
+% ==================================================================
+\section{Method}
+% ------------------------------------------------------------------
+
+\subsection{Sliding-Window Retrieval Pipeline}
+
+All embeddings are extracted offline at 2\,fps and stored as float16 arrays. At query time, we slide a window of width $w$ seconds across the frame sequence. For each center frame $t$, we mean-pool all frame embeddings within $[t - w/2,\; t + w/2]$ and L2-normalize the result to obtain a window embedding $\mathbf{v}_t$. The text query is encoded once to produce $\mathbf{q}$. Every window is then scored by cosine similarity $s_t = \mathbf{q}^\top \mathbf{v}_t$. For moment retrieval the top-$K$ timestamps are returned; for action spotting the full score sequence is used as the confidence signal for AP computation.
+
+\subsection{Feature Extraction}
+
+\noindent\textbf{CLIP ViT-L/14.}
+Frames are decoded at 2\,fps, resized, and passed through the CLIP vision encoder~\cite{radford2021clip} to produce 768-dim L2-normalized embeddings. Each video half yields a $[T \times 768]$ float16 array ($T \approx 5{,}600$ for a 45-min half). Extraction takes ${\sim}85$\,s per half on a V100.
+
+\noindent\textbf{Qwen3-VL-Embedding-8B.}
+The same 2\,fps frames are passed through Qwen3-VL-Embedding-8B~\cite{qwen3vl}, loaded via \texttt{AutoModelForImageTextToText}. We pool the final hidden state at the EOS token position (\texttt{outputs.hidden\_states[-1][:, -1, :]}) and L2-normalize to obtain 4096-dim embeddings. Each half yields a $[T \times 4096]$ float16 array. Extraction requires an A100 and takes ${\sim}$10--15 min per half.
+
+\subsection{Oracle Diagnostic Framework}
+
+To separate the two sources of cross-video error we define three oracle baselines:
+
+\begin{itemize}[nosep, leftmargin=*]
+  \item \textbf{Oracle(Time):} the correct game is given; windows within it are ranked \emph{randomly}. This measures the retrieval rate attributable to game selection alone.
+  \item \textbf{Oracle(Order):} the correct game is given; windows are ranked by VLM cosine similarity. This isolates within-game visual discrimination.
+  \item \textbf{Oracle(Time+Order):} the exact ground-truth timestamp is returned. Trivially 100\%; used as a sanity check on evaluation correctness.
+\end{itemize}
+
+The gap Oracle(Time) $\to$ Oracle(Order) reflects how much visual signal the encoder carries for a given task. The gap Oracle(Order) $\to$ cross-video zero-shot reflects how much error is introduced by having to retrieve the correct game.
+
+\subsection{CLIP Fine-Tuning}
+
+We explore two fine-tuning approaches, both training for one epoch on 21,390 anonymized captions from the 281 training games.
+
+\noindent\textbf{Pairwise MSE.}
+For each caption we sample one positive clip (5s window, 4 frames, mean-pooled) and one random frame from a different game as the negative. The loss is:
+\begin{equation}
+  \mathcal{L} = (1 - \cos(\mathbf{q}, \mathbf{v}^+))^2 + \cos(\mathbf{q}, \mathbf{v}^-)^2
+  \label{eq:loss}
+\end{equation}
+which pushes positive similarity toward 1 and negative toward 0. We use AdamW with LR $10^{-6}$, batch size 4, fp16, fine-tuning both encoders on a single 16\,GB V100.
+
+\noindent\textbf{InfoNCE.}
+We also train with a symmetric InfoNCE loss using all in-batch pairs as negatives (batch 16 $\to$ 15 negatives per positive per step). This uses the same positive construction but replaces the MSE objective with cross-entropy over the in-batch similarity matrix, matching the original CLIP training objective. Training requires an A100 due to the larger batch.
+
+% ==================================================================
+\section{Experiments}
+% ------------------------------------------------------------------
+
+\subsection{Datasets}
+
+\noindent\textbf{SoccerNet Dense Video Captioning}~\cite{zhou2024soccernet} provides 36,894 annotated moments across 471 games from six European leagues. Each annotation contains a free-form description and an anonymized version (player and team names replaced). We use the official split---281 train / 92 val / 98 test games---via \texttt{getListGames} from the SoccerNet Python package, and retain only annotations where the event is visible on screen. Annotations from extra time (half\,=\,3) are excluded as no features are extracted for those periods, leaving 36,430 evaluation queries.
+
+\noindent\textbf{SoccerNet-v2}~\cite{deliege2021soccernetv2} covers 500 games annotated with 17 action classes: Goal, Corner, Foul, Yellow card, Red card, Yellow$\to$red card, Substitution, Offside, Shots on/off target, Direct/Indirect free-kick, Kick-off, Clearance, Ball out of play, Throw-in, and Penalty. We follow the official evaluation protocol and use all annotations regardless of visibility.
+
+\subsection{Implementation Details}
+
+All features are extracted at 2\,fps with a sliding window of $w = 10$\,s and stride 2\,s, yielding 1,139,746 windows across the 500 spotting games. Tolerances are $\delta_t \in \{1, 2, 5\}$\,s. Features are stored as float16 \texttt{.npz} files co-located with the video files on the KAUST IBEX cluster. CLIP runs on V100 (16\,GB); Qwen on A100 (40\,GB). Both fine-tuning variants use AdamW with fp16 for one epoch; pairwise MSE uses LR $10^{-6}$, batch 4; InfoNCE uses LR $10^{-5}$, batch 16.
+
+\subsection{Evaluation Metrics}
+
+\noindent\textbf{Moment retrieval} is evaluated with Recall@$K$ for $K \in \{1, 5, 10\}$ at tolerance $\delta_t$. A prediction at rank $k$ is a hit if it falls within $\delta_t$ seconds of the single ground-truth timestamp, in the correct game and half.
+
+\noindent\textbf{Action spotting} is evaluated with Average Precision (AP) per class and mean AP (mAP) across all 17 classes at $\delta_t \in \{1, 2, 5\}$\,s. Predictions are ranked globally by confidence score; a prediction is a true positive if it lies within $\delta_t$ of an unmatched ground-truth event in the same game and half.
+
+% ==================================================================
+\section{Results}
+% ------------------------------------------------------------------
+
+\subsection{Moment Retrieval}
+
+% Single-column table — no [H], use standard [t] so LaTeX places it
+% at the top of a column without overlapping text.
+\begin{table}[t]
+  \centering
+  \caption{Moment retrieval at $\delta_t = 5\,\text{s}$. $^\dagger$98-game test index. $^\ddagger$471-game full cross-video index.}
+  \label{tab:retrieval}
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{llccc}
+    \toprule
+    Method & Backbone & R@1 & R@5 & R@10 \\
+    \midrule
+    Random                       & ---  & 0.00\%  & 0.00\%  & 0.00\%  \\
+    Oracle(Time)                 & ---  & 1.38\%  & 6.76\%  & 13.20\% \\
+    Zero-shot$^\dagger$          & CLIP & 1.44\%  & 4.09\%  & 6.00\%  \\
+    Zero-shot$^\ddagger$         & CLIP & 0.77\%  & 2.23\%  & 3.28\%  \\
+    Zero-shot$^\dagger$          & Qwen & 0.76\%  & 2.03\%  & 3.12\%  \\
+    Fine-tuned (InfoNCE)$^\dagger$ & CLIP & 1.42\%  & 4.09\%  & 5.99\%  \\
+    Fine-tuned (pairwise)$^\ddagger$ & CLIP & 0.41\%  & 1.25\%  & 1.75\%  \\
+    Oracle(Order)                & CLIP & 4.36\%  & 13.40\% & 19.39\% \\
+    Oracle(Order)                & Qwen & 3.05\%  & 9.36\%  & 14.84\% \\
+    Oracle(Time+Order)           & ---  & 100\%   & 100\%   & 100\%   \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table}
+
+Results are shown in Table~\ref{tab:retrieval}. On the 471-game full index, zero-shot CLIP achieves 0.77\% R@1---above random but below Oracle(Time) at 1.38\%, meaning that knowing the correct game and guessing randomly already outperforms unconstrained CLIP. Oracle(Order) at 4.36\% confirms real visual signal within the correct game; the 5.7$\times$ gap is almost entirely game-selection failure.
+
+Neither fine-tuning approach improved retrieval. InfoNCE (batch 16) on the 98-game test index yields 1.42\% vs.\ 1.44\% zero-shot---statistically indistinguishable. Pairwise MSE on the 471-game index yields 0.41\%, a clear degradation from zero-shot 0.77\%, suggesting that a single random negative per step does not provide useful gradient signal for cross-video ranking. Zero-shot Qwen (0.76\%) is comparable to CLIP despite 20$\times$ more parameters; both use the 98-game test index for this comparison.
+
+\subsection{Action Spotting}
+
+\begin{table}[t]
+  \centering
+  \caption{Action spotting mAP (\%), 500 games. $^\dagger$Qwen evaluated on 100 test games only.}
+  \label{tab:spotting}
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{llccc}
+    \toprule
+    Method & BB & @1s & @2s & @5s \\
+    \midrule
+    Oracle(Time)          & ---  & 0.60\% & 1.11\% & 2.81\% \\
+    Oracle(Order)         & CLIP & 1.48\% & 2.10\% & 4.64\% \\
+    Zero-shot             & CLIP & 0.72\% & 1.16\% & 1.83\% \\
+    Zero-shot$^\dagger$   & Qwen & 0.75\% & 1.21\% & 1.77\% \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table}
+
+Action spotting results are in Table~\ref{tab:spotting} and the per-class breakdown in Table~\ref{tab:per-class}. Zero-shot CLIP achieves 1.83\% mAP@5s, below Oracle(Order) at 4.64\%---the same game-selection gap seen in moment retrieval. The per-class results reveal a clear pattern: visually distinctive and frequent events (Substitution 4.91\%, Ball out of play 4.12\%, Throw-in 3.80\%) score highest, while rare events with few ground-truth instances score near zero (Penalty 0.04\%, Yellow$\to$red 0.04\%, Red card 0.06\%). This is partly a frequency effect---rare classes have few TPs available so precision stays low even with a reasonable score---and partly a domain gap: CLIP was not trained on broadcast soccer and does not reliably associate class labels like ``Penalty'' or ``Offside'' with their visual appearance.
+
+% Full-width table placed at the bottom of the current page (or next).
+% [tp] lets LaTeX choose top or a dedicated float page; avoids overlap.
+\begin{table*}[tp]
+  \centering
+  \caption{Per-class AP@5s for CLIP zero-shot cross-video action spotting (500 games, 1,139,746 windows).}
+  \label{tab:per-class}
+  \small
+  \begin{tabular}{lc@{\hspace{2em}}lc}
+    \toprule
+    Action Class & AP@5s & Action Class & AP@5s \\
+    \midrule
+    Substitution          & 4.91\% & Indirect free-kick  & 1.45\% \\
+    Ball out of play      & 4.12\% & Corner              & 1.30\% \\
+    Throw-in              & 3.80\% & Shots on target     & 0.83\% \\
+    Direct free-kick      & 3.50\% & Shots off target    & 0.81\% \\
+    Yellow card           & 3.41\% & Goal                & 0.77\% \\
+    Foul                  & 2.09\% & Offside             & 0.39\% \\
+    Clearance             & 1.84\% & Red card            & 0.06\% \\
+    Kick-off              & 1.70\% & Penalty             & 0.04\% \\
+                          &        & Yellow$\to$red card & 0.04\% \\
+    \midrule
+    \multicolumn{2}{l}{}  & \textbf{mAP} & \textbf{1.83\%} \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+
+% ==================================================================
+\section{Discussion}
+% ------------------------------------------------------------------
+
+\noindent\textbf{Two failure modes.}
+The oracle framework separates cross-video error into two distinct failure modes. The first is \emph{game-selection failure}: CLIP scores the correct game's windows too low relative to the 470 other games. This is the dominant effect---zero-shot CLIP goes from 0.77\% R@1 to 4.36\% simply by being told the correct game. The second is \emph{within-game discrimination failure}: even with the correct game, CLIP struggles to precisely localize rare or visually subtle events. Fine-tuning on soccer-specific caption--video pairs directly targets the first mode by pulling annotated moments closer to their text descriptions in embedding space.
+
+\noindent\textbf{CLIP vs.\ Qwen.}
+Qwen3-VL-Embedding-8B (8B parameters, purpose-built for retrieval) performs surprisingly similarly to CLIP (${\sim}$400M parameters, general contrastive pretraining): 0.76\% vs.\ 0.77\% R@1 on moment retrieval, and 1.77\% vs.\ 1.83\% mAP@5s on action spotting. The larger model does not clearly win zero-shot, suggesting the soccer domain gap affects both equally and that scale alone does not compensate for domain mismatch. Qwen does show a meaningful advantage within the correct game (Oracle(Order): 3.05\% vs.\ 4.36\% R@1), so its richer representations may be more useful in a reranking setting than in global cross-video retrieval. These gains come at 5$\times$ larger embeddings and ${\sim}$10$\times$ slower extraction, requiring an A100 vs.\ a V100.
+
+\noindent\textbf{Why fine-tuning did not help.}
+InfoNCE with 15 in-batch negatives per step preserves performance (1.42\% vs.\ 1.44\% zero-shot) but does not improve it---the in-batch negatives are drawn uniformly from 281 games and are therefore easy (semantically dissimilar) negatives unlikely to reshape the game-selection boundary. Pairwise MSE with a single random negative is even weaker and actively hurts (0.41\%), likely because the random frame provides almost no informative contrast for the text query. Both results point to the same root cause: without hard negatives (frames from the same league, same team, or similar action type), the loss provides insufficient gradient signal for cross-video discrimination.
+
+\noindent\textbf{Limitations.}
+Each window is scored independently---there is no temporal reasoning across windows, and mean pooling discards fine-grained structure within the window. The two fine-tuning variants were also evaluated on different index sizes (98 vs.\ 471 games), making their absolute numbers not directly comparable; a unified evaluation on the full 471-game index is needed.
+
+\noindent\textbf{Future directions.}
+The most promising near-term extension is a two-stage pipeline: use CLIP to retrieve a shortlist of top-50 candidate windows globally, then rerank with Qwen3-VL-Reranker-8B. This combines CLIP's speed with Qwen's stronger semantic understanding while keeping cross-video inference tractable.
+
+% ==================================================================
+\section{Conclusion}
+% ------------------------------------------------------------------
+
+We presented a unified sliding-window retrieval pipeline for soccer video moment retrieval and action spotting, instantiated with CLIP ViT-L/14 and Qwen3-VL-Embedding-8B. An oracle diagnostic framework decomposes cross-video retrieval error into game-selection and within-game components, revealing that zero-shot CLIP's primary bottleneck is finding the right game (0.77\% cross-video vs.\ 4.36\% with the correct game given). Zero-shot CLIP and Qwen perform similarly despite a 20$\times$ parameter gap, suggesting domain mismatch dominates over model scale. Two fine-tuning experiments---InfoNCE with 15 in-batch negatives and pairwise MSE with one random negative---neither improved retrieval, pointing to hard negative mining as the critical missing ingredient. The oracle gap---5.7$\times$ from cross-video to within-game---provides a clear and quantified target for future retrieval improvements.
+
+\begin{thebibliography}{99}
+
+\bibitem{anne2017localizing}
+L.~Anne Hendricks, O.~Wang, E.~Shechtman, J.~Sivic, T.~Darrell, and B.~Russell.
+\newblock Localizing moments in video with natural language.
+\newblock In \emph{Proc. ICCV}, 2017.
+
+\bibitem{deliege2021soccernetv2}
+A.~Deli\`{e}ge, A.~Cioppa, S.~Giancola, M.~Seikavandi, J.~Dueholm, K.~Nasrollahi,
+  B.~Ghanem, T.~Moeslund, and M.~Van~Droogenbroeck.
+\newblock {SoccerNet-v2}: A dataset and benchmarks for holistic understanding of
+  broadcast soccer videos.
+\newblock In \emph{Proc. CVPR Workshops}, 2021.
+
+\bibitem{giancola2018soccernet}
+S.~Giancola, M.~Amine, T.~Dghaily, and B.~Ghanem.
+\newblock {SoccerNet}: A scalable dataset for action spotting in soccer videos.
+\newblock In \emph{Proc. CVPR Workshops}, 2018.
+
+\bibitem{hong2022e2espot}
+J.~Hong, M.~Fisher, M.~Gharbi, and K.~Fatahalian.
+\newblock Spotting temporally precise, fine-grained events in video.
+\newblock In \emph{Proc. ECCV}, 2022.
+
+\bibitem{qwen3vl}
+Qwen Team.
+\newblock {Qwen3-VL}: Versatile vision-language models.
+\newblock \emph{arXiv:2601.04720}, 2026.
+
+\bibitem{radford2021clip}
+A.~Radford, J.~W. Kim, C.~Hallacy, A.~Ramesh, G.~Goh, S.~Agarwal, G.~Sastry,
+  A.~Askell, P.~Mishkin, J.~Clark, G.~Krueger, and I.~Sutskever.
+\newblock Learning transferable visual models from natural language supervision.
+\newblock In \emph{Proc. ICML}, 2021.
+
+\bibitem{soldan2022mad}
+M.~Soldan, A.~Pardo, J.~Alc\'{a}zar, F.~Heilbron, C.~Zhao, S.~Giancola, and
+  B.~Ghanem.
+\newblock {MAD}: A scalable dataset for language grounding in videos from movie
+  audio descriptions.
+\newblock In \emph{Proc. CVPR}, 2022.
+
+\bibitem{zhou2024soccernet}
+M.~Zhou, S.~Giancola, A.~Cioppa, T.~Theiner, N.~Somrak, J.~Held, and
+  B.~Ghanem.
+\newblock {SoccerNet} dense video captioning.
+\newblock In \emph{Proc. CVPR Workshops}, 2024.
+
+\end{thebibliography}
+
+\end{document}
