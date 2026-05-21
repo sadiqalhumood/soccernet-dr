@@ -4,7 +4,9 @@ Zero-shot and fine-tuned baselines for **soccer video moment retrieval** and **a
 
 Both tasks share a single sliding-window inference pipeline: extract per-frame embeddings offline, mean-pool a ±5s window around each frame, then rank by cosine similarity to a text query at inference time.
 
-**PI:** Silvio Giancola (KAUST)
+**PI:** Bernard Ghanem (KAUST)
+**Supervisor:** Silvio Giancola (SoccerNet team lead, KAUST)
+**Student:** Sadiq Al-Humood (KAUST)
 
 ---
 
