@@ -2,7 +2,7 @@
 
 Zero-shot and fine-tuned baselines for **soccer video moment retrieval** and **action spotting** using CLIP and Qwen3-VL-Embedding as vision-language backbones.
 
-Both tasks share a single sliding-window inference pipeline: extract per-frame embeddings, mean-pool a ±5s window around each frame, then rank by cosine similarity to a text query.
+Both tasks share a single sliding-window inference pipeline: extract per-frame embeddings offline, mean-pool a ±5s window around each frame, then rank by cosine similarity to a text query at inference time.
 
 **PI:** Silvio Giancola (KAUST)
 
@@ -21,15 +21,19 @@ Both tasks share a single sliding-window inference pipeline: extract per-frame e
 
 ### Moment Retrieval (δt = 5s)
 
+†98-game test index · ‡471-game full cross-video index
+
 | Method | Backbone | R@1 | R@5 | R@10 |
 |---|---|---|---|---|
-| Random | — | ~0% | ~0% | ~0% |
-| Oracle(Time) | — | 1.35% | 6.96% | 13.81% |
-| Zero-shot cross-video | CLIP | 0.77% | 2.23% | 3.28% |
-| Zero-shot cross-video | Qwen | TBD | TBD | TBD |
-| Fine-tuned cross-video | CLIP | TBD | TBD | TBD |
-| Oracle(Order) | CLIP | 4.47% | 13.52% | 19.39% |
-| Oracle(Order) | Qwen | TBD | TBD | TBD |
+| Random | — | 0.00% | 0.00% | 0.00% |
+| Oracle(Time) | — | 1.38% | 6.76% | 13.20% |
+| Zero-shot cross-video† | CLIP | 1.44% | 4.09% | 6.00% |
+| Zero-shot cross-video‡ | CLIP | 0.77% | 2.23% | 3.28% |
+| Zero-shot cross-video† | Qwen | 0.76% | 2.03% | 3.12% |
+| Fine-tuned (InfoNCE, batch 16)† | CLIP | 1.42% | 4.09% | 5.99% |
+| Fine-tuned (pairwise MSE, batch 4)‡ | CLIP | 0.41% | 1.25% | 1.75% |
+| Oracle(Order) | CLIP | 4.36% | 13.40% | 19.39% |
+| Oracle(Order) | Qwen | 3.05% | 9.36% | 14.84% |
 | Oracle(Time+Order) | — | 100% | 100% | 100% |
 
 ### Action Spotting
@@ -37,10 +41,9 @@ Both tasks share a single sliding-window inference pipeline: extract per-frame e
 | Method | Backbone | mAP@1s | mAP@2s | mAP@5s |
 |---|---|---|---|---|
 | Oracle(Time) — random floor | — | 0.60% | 1.11% | 2.81% |
-| Oracle(Order) | CLIP | 1.48% | 2.10% | 4.64% |
+| Oracle(Order) — within-game | CLIP | 1.48% | 2.10% | 4.64% |
 | Cross-video zero-shot | CLIP | 0.72% | 1.16% | 1.83% |
-| Cross-video zero-shot | Qwen | TBD | TBD | TBD |
-| Cross-video fine-tuned | CLIP | TBD | TBD | TBD |
+| Cross-video zero-shot (100 games) | Qwen | 0.75% | 1.21% | 1.77% |
 
 ---
 
@@ -61,14 +64,18 @@ clip/
   baseline_oracle_time_spotting.py  # Spotting: random within-game AP
   baseline_oracle_order_spotting.py # Spotting: CLIP within-game AP
 
-  finetune_clip_simple.py           # Pairwise fine-tuning (1 pos + 1 neg, MSE loss)
+  finetune_clip_simple.py           # Pairwise MSE fine-tuning (1 pos + 1 neg, batch 4, V100)
+  finetune_clip_best.py             # InfoNCE fine-tuning (in-batch negatives, batch 16, A100)
 
   run_baseline_clip.sh              # SLURM: run moment retrieval baseline
   run_baselines.sh                  # SLURM: run all moment retrieval baselines
   run_spotting_baselines.sh         # SLURM: run all 3 spotting baselines
-  run_finetune_clip_simple.sh       # SLURM: fine-tune CLIP (V100, auto-resume)
-  run_extract_test_ft_features.sh   # SLURM: re-extract test split with fine-tuned model
-  run_extract_all_ft_features.sh    # SLURM: re-extract all games with fine-tuned model
+  run_finetune_clip_simple.sh       # SLURM: pairwise MSE fine-tuning (V100, auto-resume)
+  run_finetune_best.sh              # SLURM: InfoNCE fine-tuning (A100, 1 epoch)
+  run_extract_test_ft_features.sh   # SLURM: re-extract test split (pairwise checkpoint)
+  run_extract_all_ft_features.sh    # SLURM: re-extract all games (pairwise checkpoint)
+  run_extract_best_features.sh      # SLURM: re-extract test split (InfoNCE checkpoint)
+  run_eval_best_test.sh             # SLURM: evaluate InfoNCE checkpoint on test split
 
   analyze_results.py                # Parse results JSON, print per-event breakdown
 
@@ -152,16 +159,34 @@ test_games  = getListGames("test",  task="caption")  #  98 games
 
 ## CLIP Fine-Tuning
 
-Pairwise MSE loss — Silvio's simplified design:
+Two fine-tuning approaches, both training for one epoch on 21,390 anonymized captions from the 281 training games.
+
+### Pairwise MSE (V100, batch 4)
 
 - **Positive:** 5s clip centered on annotated moment, 4 frames, mean-pooled
 - **Negative:** random frame from a different game
 - **Loss:** `(1 − sim_pos)² + sim_neg²`
 - AdamW, LR 1e-6, batch 4, fp16 — fits on a single V100 (16 GB)
-- Training uses `anonymized` captions (no player/team names)
 
 ```bash
-sbatch clip/run_finetune_clip_simple.sh          # train epoch 1
+sbatch clip/run_finetune_clip_simple.sh          # train
 sbatch clip/run_extract_test_ft_features.sh      # re-extract test split
-python clip/baseline_clip.py --eval_split test --feature_suffix _ft ...
+sbatch clip/run_extract_all_ft_features.sh       # re-extract all games (for spotting)
 ```
+
+**Result:** R@1 = 0.41% on 471-game index (degraded from zero-shot 0.77% — random negatives insufficient)
+
+### InfoNCE (A100, batch 16)
+
+- **Positive:** same 5s clip construction
+- **Negatives:** all other (query, clip) pairs within the batch — 15 negatives per positive
+- **Loss:** symmetric cross-entropy over in-batch similarity matrix (CLIP training objective)
+- AdamW, LR 1e-5, batch 16, fp16
+
+```bash
+sbatch clip/run_finetune_best.sh                 # train (A100, ~20 min)
+sbatch clip/run_extract_best_features.sh         # re-extract test split
+sbatch clip/run_eval_best_test.sh                # evaluate on test split
+```
+
+**Result:** R@1 = 1.42% on 98-game test index (vs zero-shot 1.44% — no meaningful gain)
