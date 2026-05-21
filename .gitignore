@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.npz
+*.pt
+*.pth
+*.log
+*.out
+*.err
+results/
+logs/
+*.json
+!requirements.txt
+.DS_Store
